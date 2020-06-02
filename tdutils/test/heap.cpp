@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "td/utils/tests.h"
 
@@ -38,8 +38,8 @@ TEST(Heap, sort_random_perm) {
   for (int i = 0; i < n; i++) {
     v[i] = i;
   }
-  std::srand(123);
-  std::random_shuffle(v.begin(), v.end());
+  td::Random::Xorshift128plus rnd(123);
+  td::random_shuffle(as_mutable_span(v), rnd);
   std::vector<HeapNode> nodes(n);
   KHeap<int> kheap;
   for (int i = 0; i < n; i++) {

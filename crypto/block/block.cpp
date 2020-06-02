@@ -14,19 +14,73 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "td/utils/bits.h"
 #include "block/block.h"
 #include "block/block-auto.h"
 #include "block/block-parse.h"
+#include "block/mc-config.h"
 #include "ton/ton-shard.h"
+#include "common/bigexp.h"
 #include "common/util.h"
 #include "td/utils/crypto.h"
 #include "td/utils/tl_storers.h"
+#include "td/utils/misc.h"
+#include "td/utils/Random.h"
 
 namespace block {
 using namespace std::literals::string_literals;
+
+td::Result<PublicKey> PublicKey::from_bytes(td::Slice key) {
+  if (key.size() != 32) {
+    return td::Status::Error("Ed25519 public key must be exactly 32 bytes long");
+  }
+  PublicKey res;
+  res.key = key.str();
+  return res;
+}
+
+td::Result<PublicKey> PublicKey::parse(td::Slice key) {
+  if (key.size() != 48) {
+    return td::Status::Error("Serialized Ed25519 public key must be exactly 48 characters long");
+  }
+  td::uint8 buf[36];
+  if (!buff_base64_decode(td::MutableSlice(buf, 36), key, true)) {
+    return td::Status::Error("Public key is not serialized in base64 encoding");
+  }
+
+  td::uint16 hash = static_cast<td::uint16>((static_cast<unsigned>(buf[34]) << 8) + buf[35]);
+  if (hash != td::crc16(td::Slice(buf, 34))) {
+    return td::Status::Error("Public key has incorrect crc16 hash");
+  }
+
+  if (buf[0] != 0x3e) {
+    return td::Status::Error("Not a public key");
+  }
+  if (buf[1] != 0xe6) {
+    return td::Status::Error("Not an ed25519 public key");
+  }
+
+  return from_bytes(td::Slice(buf + 2, 32));
+}
+
+std::string PublicKey::serialize(bool base64_url) {
+  CHECK(key.size() == 32);
+  std::string buf(36, 0);
+  td::MutableSlice bytes(buf);
+
+  bytes[0] = static_cast<char>(0x3e);
+  bytes[1] = static_cast<char>(0xe6);
+  bytes.substr(2).copy_from(key);
+  auto hash = td::crc16(bytes.substr(0, 34));
+  bytes[34] = static_cast<char>(hash >> 8);
+  bytes[35] = static_cast<char>(hash & 255);
+
+  std::string res(48, 0);
+  buff_base64_encode(res, bytes, base64_url);
+  return res;
+}
 
 bool pack_std_smc_addr_to(char result[48], bool base64_url, ton::WorkchainId wc, const ton::StdSmcAddress& addr,
                           bool bounceable, bool testnet) {
@@ -316,14 +370,14 @@ std::unique_ptr<MsgProcessedUptoCollection> MsgProcessedUptoCollection::unpack(t
   return v && v->valid ? std::move(v) : std::unique_ptr<MsgProcessedUptoCollection>{};
 }
 
-bool MsgProcessedUpto::contains(const MsgProcessedUpto& other) const & {
+bool MsgProcessedUpto::contains(const MsgProcessedUpto& other) const& {
   return ton::shard_is_ancestor(shard, other.shard) && mc_seqno >= other.mc_seqno &&
          (last_inmsg_lt > other.last_inmsg_lt ||
           (last_inmsg_lt == other.last_inmsg_lt && !(last_inmsg_hash < other.last_inmsg_hash)));
 }
 
 bool MsgProcessedUpto::contains(ton::ShardId other_shard, ton::LogicalTime other_lt, td::ConstBitPtr other_hash,
-                                ton::BlockSeqno other_mc_seqno) const & {
+                                ton::BlockSeqno other_mc_seqno) const& {
   return ton::shard_is_ancestor(shard, other_shard) && mc_seqno >= other_mc_seqno &&
          (last_inmsg_lt > other_lt || (last_inmsg_lt == other_lt && !(last_inmsg_hash < other_hash)));
 }
@@ -500,7 +554,9 @@ bool MsgProcessedUpto::already_processed(const EnqueuedMsgDescr& msg) const {
   if (msg.lt_ == last_inmsg_lt && last_inmsg_hash < msg.hash_) {
     return false;
   }
-  if (ton::shard_contains(shard, msg.cur_prefix_.account_id_prefix)) {
+  if (msg.same_workchain() && ton::shard_contains(shard, msg.cur_prefix_.account_id_prefix)) {
+    // this branch is needed only for messages generated in the same shard
+    // (such messages could have been processed without a reference from the masterchain)
     // ? enable this branch only if an extra boolean parameter is set ?
     return true;
   }
@@ -523,6 +579,15 @@ bool MsgProcessedUptoCollection::already_processed(const EnqueuedMsgDescr& msg) 
   return false;
 }
 
+bool MsgProcessedUptoCollection::can_check_processed() const {
+  for (const auto& entry : list) {
+    if (!entry.can_check_processed()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool MsgProcessedUptoCollection::for_each_mcseqno(std::function<bool(ton::BlockSeqno)> func) const {
   for (const auto& entry : list) {
     if (!func(entry.mc_seqno)) {
@@ -530,6 +595,36 @@ bool MsgProcessedUptoCollection::for_each_mcseqno(std::function<bool(ton::BlockS
     }
   }
   return true;
+}
+
+std::ostream& MsgProcessedUpto::print(std::ostream& os) const {
+  return os << "[" << ton::shard_to_str(shard) << "," << mc_seqno << "," << last_inmsg_lt << ","
+            << last_inmsg_hash.to_hex() << "]";
+}
+
+std::ostream& MsgProcessedUptoCollection::print(std::ostream& os) const {
+  os << "MsgProcessedUptoCollection of " << owner.to_str() << " = {";
+  int i = 0;
+  for (const auto& entry : list) {
+    if (i++) {
+      os << ", ";
+    }
+    os << entry;
+  }
+  os << "}";
+  return os;
+}
+
+std::string MsgProcessedUpto::to_str() const {
+  std::ostringstream os;
+  print(os);
+  return os.str();
+}
+
+std::string MsgProcessedUptoCollection::to_str() const {
+  std::ostringstream os;
+  print(os);
+  return os.str();
 }
 
 // unpacks some fields from EnqueuedMsg
@@ -664,12 +759,9 @@ td::Status ShardState::unpack_state(ton::BlockIdExt blkid, Ref<vm::Cell> prev_st
     return td::Status::Error(-666, "shardchain state for "s + blkid.to_str() +
                                        " corresponds to incorrect workchain or shard " + shard1.to_str());
   }
-  if (state.vert_seq_no) {
-    return td::Status::Error(
-        -666, "shardchain state for "s + blkid.to_str() + " has non-zero vert_seq_no, which is unsupported");
-  }
   id_ = blkid;
   root_ = std::move(prev_state_root);
+  vert_seqno_ = state.vert_seq_no;
   before_split_ = state.before_split;
   account_dict_ = std::make_unique<vm::AugmentedDictionary>(
       vm::load_cell_slice(std::move(state.accounts)).prefetch_ref(), 256, block::tlb::aug_ShardAccounts);
@@ -737,6 +829,15 @@ td::Status ShardState::unpack_state(ton::BlockIdExt blkid, Ref<vm::Cell> prev_st
     if (!global_balance_.validate_unpack(extra.global_balance)) {
       return td::Status::Error(-666, "ShardState of "s + id_.to_str() + " does not contain a valid global_balance");
     }
+    if (extra.r1.flags & 1) {
+      if (extra.r1.block_create_stats->prefetch_ulong(8) == 0x17) {
+        block_create_stats_ = std::make_unique<vm::Dictionary>(extra.r1.block_create_stats->prefetch_ref(), 256);
+      } else {
+        return td::Status::Error(-666, "ShardState of "s + id_.to_str() + " does not contain a valid BlockCreateStats");
+      }
+    } else {
+      block_create_stats_ = std::make_unique<vm::Dictionary>(256);
+    }
   }
   return unpack_out_msg_queue_info(std::move(state.out_msg_queue_info));
 }
@@ -749,15 +850,15 @@ td::Status ShardState::unpack_out_msg_queue_info(Ref<vm::Cell> out_msg_queue_inf
   }
   out_msg_queue_ =
       std::make_unique<vm::AugmentedDictionary>(std::move(qinfo.out_queue), 352, block::tlb::aug_OutMsgQueue);
-  if (verbosity >= 3 * 0) {
+  if (verbosity >= 3 * 1) {
     LOG(DEBUG) << "unpacking ProcessedUpto of our previous block " << id_.to_str();
     block::gen::t_ProcessedInfo.print(std::cerr, qinfo.proc_info);
   }
-  if (!block::gen::t_ProcessedInfo.validate_csr(qinfo.proc_info)) {
+  if (!block::gen::t_ProcessedInfo.validate_csr(1024, qinfo.proc_info)) {
     return td::Status::Error(
         -666, "ProcessedInfo in the state of "s + id_.to_str() + " is invalid according to automated validity checks");
   }
-  if (!block::gen::t_IhrPendingInfo.validate_csr(qinfo.ihr_pending)) {
+  if (!block::gen::t_IhrPendingInfo.validate_csr(1024, qinfo.ihr_pending)) {
     return td::Status::Error(
         -666, "IhrPendingInfo in the state of "s + id_.to_str() + " is invalid according to automated validity checks");
   }
@@ -891,14 +992,16 @@ td::Status ShardState::merge_with(ShardState& sib) {
   lt_ = std::max(lt_, sib.lt_);
   // 9. compute underload & overload history
   underload_history_ = overload_history_ = 0;
+  // 10. compute vert_seqno
+  vert_seqno_ = std::max(vert_seqno_, sib.vert_seqno_);
   // Anything else? add here
   // ...
 
-  // 10. compute new root
+  // 100. compute new root
   if (!block::gen::t_ShardState.cell_pack_split_state(root_, std::move(root_), std::move(sib.root_))) {
     return td::Status::Error(-667, "cannot construct a virtual split_state after a merge");
   }
-  // 11. invalidate sibling, change id_ to the (virtual) common parent
+  // 101. invalidate sibling, change id_ to the (virtual) common parent
   sib.invalidate();
   id_.id.shard = shard.shard;
   id_.file_hash.set_zero();
@@ -974,7 +1077,7 @@ td::Status ShardState::split(ton::ShardIdFull subshard) {
   LOG(DEBUG) << "splitting total_balance";
   auto old_total_balance = total_balance_;
   auto accounts_extra = account_dict_->get_root_extra();
-  if (!(accounts_extra.write().advance(5) && total_balance_.validate_unpack(accounts_extra))) {
+  if (!(accounts_extra.write().advance(5) && total_balance_.validate_unpack(accounts_extra, 1024))) {
     LOG(ERROR) << "cannot unpack CurrencyCollection from the root of newly-split accounts dictionary";
     return td::Status::Error(
         -666, "error splitting total balance in account dictionary of shardchain state "s + id_.to_str());
@@ -1023,16 +1126,16 @@ int filter_out_msg_queue(vm::AugmentedDictionary& out_queue, ton::ShardIdFull ol
   });
 }
 
-bool CurrencyCollection::validate() const {
-  return is_valid() && td::sgn(grams) >= 0 && validate_extra();
+bool CurrencyCollection::validate(int max_cells) const {
+  return is_valid() && td::sgn(grams) >= 0 && validate_extra(max_cells);
 }
 
-bool CurrencyCollection::validate_extra() const {
+bool CurrencyCollection::validate_extra(int max_cells) const {
   if (extra.is_null()) {
     return true;
   }
   vm::CellBuilder cb;
-  return cb.store_maybe_ref(extra) && block::tlb::t_ExtraCurrencyCollection.validate_ref(cb.finalize());
+  return cb.store_maybe_ref(extra) && block::tlb::t_ExtraCurrencyCollection.validate_ref(max_cells, cb.finalize());
 }
 
 bool CurrencyCollection::add(const CurrencyCollection& a, const CurrencyCollection& b, CurrencyCollection& c) {
@@ -1203,8 +1306,8 @@ bool CurrencyCollection::unpack(Ref<vm::CellSlice> csr) {
   return unpack_CurrencyCollection(std::move(csr), grams, extra) || invalidate();
 }
 
-bool CurrencyCollection::validate_unpack(Ref<vm::CellSlice> csr) {
-  return (csr.not_null() && block::tlb::t_CurrencyCollection.validate(*csr) &&
+bool CurrencyCollection::validate_unpack(Ref<vm::CellSlice> csr, int max_cells) {
+  return (csr.not_null() && block::tlb::t_CurrencyCollection.validate_upto(max_cells, *csr) &&
           unpack_CurrencyCollection(std::move(csr), grams, extra)) ||
          invalidate();
 }
@@ -1336,6 +1439,197 @@ std::ostream& operator<<(std::ostream& os, const ValueFlow& vflow) {
   return os;
 }
 
+bool DiscountedCounter::increase_by(unsigned count, ton::UnixTime now) {
+  if (!validate()) {
+    return false;
+  }
+  td::uint64 scaled = (td::uint64(count) << 32);
+  if (!total) {
+    last_updated = now;
+    total = count;
+    cnt2048 = scaled;
+    cnt65536 = scaled;
+    return true;
+  }
+  if (count > ~total || cnt2048 > ~scaled || cnt65536 > ~scaled) {
+    return false /* invalidate() */;  // overflow
+  }
+  unsigned dt = (now >= last_updated ? now - last_updated : 0);
+  if (dt > 0) {
+    // more precise version of cnt2048 = llround(cnt2048 * exp(-dt / 2048.));
+    // (rounding error has absolute value < 1)
+    cnt2048 = (dt >= 48 * 2048 ? 0 : td::umulnexps32(cnt2048, dt << 5));
+    // more precise version of cnt65536 = llround(cnt65536 * exp(-dt / 65536.));
+    // (rounding error has absolute value < 1)
+    cnt65536 = td::umulnexps32(cnt65536, dt);
+  }
+  total += count;
+  cnt2048 += scaled;
+  cnt65536 += scaled;
+  last_updated = now;
+  return true;
+}
+
+bool DiscountedCounter::validate() {
+  if (!is_valid()) {
+    return false;
+  }
+  if (!total) {
+    if (cnt2048 | cnt65536) {
+      return invalidate();
+    }
+  } else if (!last_updated) {
+    return invalidate();
+  }
+  return true;
+}
+
+bool DiscountedCounter::fetch(vm::CellSlice& cs) {
+  valid = (cs.fetch_uint_to(32, last_updated) && cs.fetch_uint_to(64, total) && cs.fetch_uint_to(64, cnt2048) &&
+           cs.fetch_uint_to(64, cnt65536));
+  return validate() || invalidate();
+}
+
+bool DiscountedCounter::unpack(Ref<vm::CellSlice> csr) {
+  return (csr.not_null() && fetch(csr.write()) && csr->empty_ext()) || invalidate();
+}
+
+bool DiscountedCounter::store(vm::CellBuilder& cb) const {
+  return is_valid() && cb.store_long_bool(last_updated, 32) && cb.store_long_bool(total, 64) &&
+         cb.store_long_bool(cnt2048, 64) && cb.store_long_bool(cnt65536, 64);
+}
+
+Ref<vm::CellSlice> DiscountedCounter::pack() const {
+  vm::CellBuilder cb;
+  if (store(cb)) {
+    return vm::load_cell_slice_ref(cb.finalize());
+  } else {
+    return {};
+  }
+}
+
+bool DiscountedCounter::show(std::ostream& os) const {
+  if (!is_valid()) {
+    os << "<invalid-counter>";
+    return false;
+  }
+  os << "(counter last_updated:" << last_updated << " total:" << total << " cnt2048: " << (double)cnt2048 / (1LL << 32)
+     << " cnt65536: " << (double)cnt65536 / (1LL << 32) << ")";
+  return true;
+}
+
+std::string DiscountedCounter::to_str() const {
+  std::ostringstream stream;
+  if (show(stream)) {
+    return stream.str();
+  } else {
+    return "<invalid-counter>";
+  }
+}
+
+bool fetch_CreatorStats(vm::CellSlice& cs, DiscountedCounter& mc_cnt, DiscountedCounter& shard_cnt) {
+  return cs.fetch_ulong(4) == 4   // creator_info#4
+         && mc_cnt.fetch(cs)      // mc_blocks:Counters
+         && shard_cnt.fetch(cs);  // shard_blocks:Counters
+}
+
+bool store_CreatorStats(vm::CellBuilder& cb, const DiscountedCounter& mc_cnt, const DiscountedCounter& shard_cnt) {
+  return cb.store_long_bool(4, 4)  // creator_info#4
+         && mc_cnt.store(cb)       // mc_blocks:Counters
+         && shard_cnt.store(cb);   // shard_blocks:Counters
+}
+
+bool unpack_CreatorStats(Ref<vm::CellSlice> cs, DiscountedCounter& mc_cnt, DiscountedCounter& shard_cnt) {
+  if (cs.is_null()) {
+    return mc_cnt.set_zero() && shard_cnt.set_zero();
+  } else {
+    return fetch_CreatorStats(cs.write(), mc_cnt, shard_cnt) && cs->empty_ext();
+  }
+}
+
+/*
+ *
+ *    Monte Carlo simulator for computing the share of shardchain blocks generated by each validator
+ *
+ */
+
+bool MtCarloComputeShare::compute() {
+  ok = false;
+  if (W.size() >= (1U << 31) || W.empty()) {
+    return false;
+  }
+  K = std::min(K, N);
+  if (K <= 0 || iterations <= 0) {
+    return false;
+  }
+  double tot_weight = 0., acc = 0.;
+  for (int i = 0; i < N; i++) {
+    if (W[i] <= 0.) {
+      return false;
+    }
+    tot_weight += W[i];
+  }
+  CW.resize(N);
+  RW.resize(N);
+  for (int i = 0; i < N; i++) {
+    CW[i] = acc;
+    acc += W[i] /= tot_weight;
+    RW[i] = 0.;
+  }
+  R0 = 0.;
+  H.resize(N);
+  A.resize(K);
+  for (long long it = 0; it < iterations; ++it) {
+    gen_vset();
+  }
+  for (int i = 0; i < N; i++) {
+    RW[i] = W[i] * (RW[i] + R0) / (double)iterations;
+  }
+  return ok = true;
+}
+
+void MtCarloComputeShare::gen_vset() {
+  double total_wt = 1.;
+  int hc = 0;
+  for (int i = 0; i < K; i++) {
+    CHECK(total_wt > 0);
+    double inv_wt = 1. / total_wt;
+    R0 += inv_wt;
+    for (int j = 0; j < i; j++) {
+      RW[A[j]] -= inv_wt;
+    }
+    // double p = drand48() * total_wt;
+    double p = (double)td::Random::fast_uint64() * total_wt / (1. * (1LL << 32) * (1LL << 32));
+    for (int h = 0; h < hc; h++) {
+      if (p < H[h].first) {
+        break;
+      }
+      p += H[h].second;
+    }
+    int a = -1, b = N, c;
+    while (b - a > 1) {
+      c = ((a + b) >> 1);
+      if (CW[c] <= p) {
+        a = c;
+      } else {
+        b = c;
+      }
+    }
+    CHECK(a >= 0 && a < N);
+    CHECK(total_wt >= W[a]);
+    total_wt -= W[a];
+    double x = CW[a];
+    c = hc++;
+    while (c > 0 && H[c - 1].first > x) {
+      H[c] = H[c - 1];
+      --c;
+    }
+    H[c].first = x;
+    H[c].second = W[a];
+    A[i] = a;
+  }
+}
+
 /*
  * 
  *    Other block-related functions
@@ -1423,7 +1717,7 @@ bool check_one_config_param(Ref<vm::CellSlice> cs_ref, td::ConstBitPtr key, td::
   } else if (idx < 0) {
     return true;
   }
-  bool ok = block::gen::ConfigParam{idx}.validate_ref(std::move(cell));
+  bool ok = block::gen::ConfigParam{idx}.validate_ref(1024, std::move(cell));
   if (!ok) {
     LOG(ERROR) << "configuration parameter #" << idx << " is invalid";
   }
@@ -1432,33 +1726,50 @@ bool check_one_config_param(Ref<vm::CellSlice> cs_ref, td::ConstBitPtr key, td::
 
 const int mandatory_config_params[] = {18, 20, 21, 22, 23, 24, 25, 28, 34};
 
-bool valid_config_data(Ref<vm::Cell> cell, const td::BitArray<256>& addr, bool catch_errors, bool relax_par0) {
+bool valid_config_data(Ref<vm::Cell> cell, const td::BitArray<256>& addr, bool catch_errors, bool relax_par0,
+                       Ref<vm::Cell> old_mparams) {
   using namespace std::placeholders;
   if (cell.is_null()) {
     return false;
   }
-  if (!catch_errors) {
-    vm::Dictionary dict{std::move(cell), 32};
-    for (int x : mandatory_config_params) {
-      if (!dict.int_key_exists(x)) {
-        LOG(ERROR) << "mandatory configuration parameter #" << x << " is missing";
-        return false;
-      }
+  if (catch_errors) {
+    try {
+      return valid_config_data(std::move(cell), addr, false, relax_par0, std::move(old_mparams));
+    } catch (vm::VmError&) {
+      return false;
     }
-    return dict.check_for_each(std::bind(check_one_config_param, _1, _2, addr.cbits(), relax_par0));
   }
-  try {
-    vm::Dictionary dict{std::move(cell), 32};
-    for (int x : mandatory_config_params) {
-      if (!dict.int_key_exists(x)) {
-        LOG(ERROR) << "mandatory configuration parameter #" << x << " is missing";
-        return false;
-      }
-    }
-    return dict.check_for_each(std::bind(check_one_config_param, _1, _2, addr.cbits(), relax_par0));
-  } catch (vm::VmError&) {
+  vm::Dictionary dict{std::move(cell), 32};
+  if (!dict.check_for_each(std::bind(check_one_config_param, _1, _2, addr.cbits(), relax_par0))) {
     return false;
   }
+  for (int x : mandatory_config_params) {
+    if (!dict.int_key_exists(x)) {
+      LOG(ERROR) << "mandatory configuration parameter #" << x << " is missing";
+      return false;
+    }
+  }
+  return config_params_present(dict, dict.lookup_ref(td::BitArray<32>{9})) &&
+         config_params_present(dict, std::move(old_mparams));
+}
+
+bool config_params_present(vm::Dictionary& dict, Ref<vm::Cell> param_dict_root) {
+  auto res = block::Config::unpack_param_dict(std::move(param_dict_root));
+  if (res.is_error()) {
+    LOG(ERROR)
+        << "invalid mandatory parameters dictionary while checking existence of all mandatory configuration parameters";
+    return false;
+  }
+  for (int x : res.move_as_ok()) {
+    // LOG(DEBUG) << "checking whether mandatory configuration parameter #" << x << " exists";
+    if (!dict.int_key_exists(x)) {
+      LOG(ERROR) << "configuration parameter #" << x
+                 << " (declared as mandatory in configuration parameter #9) is missing";
+      return false;
+    }
+  }
+  // LOG(DEBUG) << "all mandatory configuration parameters present";
+  return true;
 }
 
 bool add_extra_currency(Ref<vm::Cell> extra1, Ref<vm::Cell> extra2, Ref<vm::Cell>& res) {
@@ -1481,7 +1792,7 @@ bool sub_extra_currency(Ref<vm::Cell> extra1, Ref<vm::Cell> extra2, Ref<vm::Cell
     res.clear();
     return false;
   } else {
-    return block::tlb::t_ExtraCurrencyCollection.sub_values_ref(res, std::move(extra1), std::move(extra2));
+    return block::tlb::t_ExtraCurrencyCollection.sub_values_ref(res, std::move(extra1), std::move(extra2)) >= 0;
   }
 }
 
@@ -1496,7 +1807,7 @@ ton::AccountIdPrefixFull interpolate_addr(const ton::AccountIdPrefixFull& src, c
     unsigned long long mask = (std::numeric_limits<td::uint64>::max() >> (d - 32));
     return ton::AccountIdPrefixFull{dest.workchain, (dest.account_id_prefix & ~mask) | (src.account_id_prefix & mask)};
   } else {
-    int mask = (-1 >> d);
+    int mask = (int)(~0U >> d);
     return ton::AccountIdPrefixFull{(dest.workchain & ~mask) | (src.workchain & mask), src.account_id_prefix};
   }
 }
@@ -1514,8 +1825,8 @@ std::pair<int, int> perform_hypercube_routing(ton::AccountIdPrefixFull src, ton:
   if (!ton::shard_contains(cur, transit)) {
     return {-1, -1};
   }
-  if (transit.account_id_prefix == dest.account_id_prefix || ton::shard_contains(cur, dest)) {
-    // if destination is already reached, or is in this shard, set cur:=next_hop:=dest
+  if (ton::shard_contains(cur, dest)) {
+    // if destination is in this shard, set cur:=next_hop:=dest
     return {96, 96};
   }
   if (transit.workchain == ton::masterchainId || dest.workchain == ton::masterchainId) {
@@ -1576,7 +1887,7 @@ td::Status unpack_block_prev_blk_ext(Ref<vm::Cell> block_root, const ton::BlockI
   block::gen::ExtBlkRef::Record mcref;  // _ ExtBlkRef = BlkMasterInfo;
   ton::ShardIdFull shard;
   if (!(tlb::unpack_cell(block_root, blk) && tlb::unpack_cell(blk.info, info) && !info.version &&
-        block::tlb::t_ShardIdent.unpack(info.shard.write(), shard) && !info.vert_seq_no &&
+        block::tlb::t_ShardIdent.unpack(info.shard.write(), shard) &&
         (!info.not_master || tlb::unpack_cell(info.master_ref, mcref)))) {
     return td::Status::Error("cannot unpack block header");
   }
@@ -1640,7 +1951,53 @@ td::Status unpack_block_prev_blk_ext(Ref<vm::Cell> block_root, const ton::BlockI
   } else {
     mc_blkid = ton::BlockIdExt{ton::masterchainId, ton::shardIdAll, mcref.seq_no, mcref.root_hash, mcref.file_hash};
   }
+  if (shard.is_masterchain() && info.vert_seqno_incr && !info.key_block) {
+    return td::Status::Error("non-key masterchain block cannot have vert_seqno_incr set");
+  }
   return td::Status::OK();
+}
+
+td::Status check_block_header(Ref<vm::Cell> block_root, const ton::BlockIdExt& id, ton::Bits256* store_shard_hash_to) {
+  block::gen::Block::Record blk;
+  block::gen::BlockInfo::Record info;
+  ton::ShardIdFull shard;
+  if (!(tlb::unpack_cell(block_root, blk) && tlb::unpack_cell(blk.info, info) && !info.version &&
+        block::tlb::t_ShardIdent.unpack(info.shard.write(), shard))) {
+    return td::Status::Error("cannot unpack block header");
+  }
+  ton::BlockId hdr_id{shard, (unsigned)info.seq_no};
+  if (id.id != hdr_id) {
+    return td::Status::Error("block header contains block id "s + hdr_id.to_str() + ", expected " + id.id.to_str());
+  }
+  if (id.root_hash != block_root->get_hash().bits()) {
+    return td::Status::Error("block header has incorrect root hash "s + block_root->get_hash().bits().to_hex(256) +
+                             " instead of expected " + id.root_hash.to_hex());
+  }
+  if (info.not_master != !shard.is_masterchain()) {
+    return td::Status::Error("block has invalid not_master flag in its (Merkelized) header");
+  }
+  if (store_shard_hash_to) {
+    vm::CellSlice upd_cs{vm::NoVmSpec(), blk.state_update};
+    if (!(upd_cs.is_special() && upd_cs.prefetch_long(8) == 4  // merkle update
+          && upd_cs.size_ext() == 0x20228)) {
+      return td::Status::Error("invalid Merkle update in block header");
+    }
+    auto upd_hash = upd_cs.prefetch_ref(1)->get_hash(0);
+    *store_shard_hash_to = upd_hash.bits();
+  }
+  return td::Status::OK();
+}
+
+std::unique_ptr<vm::Dictionary> get_block_create_stats_dict(Ref<vm::Cell> state_root) {
+  block::gen::ShardStateUnsplit::Record info;
+  block::gen::McStateExtra::Record extra;
+  block::gen::BlockCreateStats::Record_block_create_stats cstats;
+  if (!(::tlb::unpack_cell(std::move(state_root), info) && info.custom->size_refs() &&
+        ::tlb::unpack_cell(info.custom->prefetch_ref(), extra) && (extra.r1.flags & 1) &&
+        ::tlb::csr_unpack(std::move(extra.r1.block_create_stats), cstats))) {
+    return {};
+  }
+  return std::make_unique<vm::Dictionary>(std::move(cstats.counters), 256);
 }
 
 std::unique_ptr<vm::AugmentedDictionary> get_prev_blocks_dict(Ref<vm::Cell> state_root) {

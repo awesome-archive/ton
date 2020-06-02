@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "td/utils/port/signals.h"
 
@@ -329,6 +329,9 @@ static void default_failure_signal_handler(int sig) {
 }
 
 Status set_default_failure_signal_handler() {
+#if TD_PORT_POSIX
+  Stdin();  // init static variables before atexit
+#endif
   std::atexit(block_stdin);
   TRY_STATUS(setup_signals_alt_stack());
   TRY_STATUS(set_signal_handler(SignalType::Abort, default_failure_signal_handler));

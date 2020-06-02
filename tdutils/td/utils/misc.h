@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -44,12 +44,12 @@ std::pair<T, T> split(T s, char delimiter = ' ') {
 }
 
 template <class T>
-vector<T> full_split(T s, char delimiter = ' ') {
+vector<T> full_split(T s, char delimiter = ' ', size_t max_parts = std::numeric_limits<size_t>::max()) {
   vector<T> result;
   if (s.empty()) {
     return result;
   }
-  while (true) {
+  while (result.size() + 1 < max_parts) {
     auto delimiter_pos = s.find(delimiter);
     if (delimiter_pos == string::npos) {
       result.push_back(std::move(s));
@@ -59,6 +59,8 @@ vector<T> full_split(T s, char delimiter = ' ') {
       s = s.substr(delimiter_pos + 1);
     }
   }
+  result.push_back(std::move(s));
+  return result;
 }
 
 string implode(const vector<string> &v, char delimiter = ' ');
@@ -153,10 +155,11 @@ inline char to_lower(char c) {
   return c;
 }
 
-inline void to_lower_inplace(MutableSlice slice) {
+inline MutableSlice to_lower_inplace(MutableSlice slice) {
   for (auto &c : slice) {
     c = to_lower(c);
   }
+  return slice;
 }
 
 inline string to_lower(Slice slice) {
@@ -300,6 +303,20 @@ typename std::enable_if<std::is_unsigned<T>::value, T>::type hex_to_integer(Slic
   return integer_value;
 }
 
+template <class T>
+Result<typename std::enable_if<std::is_unsigned<T>::value, T>::type> hex_to_integer_safe(Slice str) {
+  T integer_value = 0;
+  auto begin = str.begin();
+  auto end = str.end();
+  while (begin != end) {
+    if (!is_hex_digit(*begin)) {
+      return Status::Error("not a hex digit");
+    }
+    integer_value = static_cast<T>(integer_value * 16 + hex_to_int(*begin++));
+  }
+  return integer_value;
+}
+
 double to_double(Slice str);
 
 template <class T>
@@ -321,8 +338,8 @@ string url_encode(Slice str);
 
 namespace detail {
 template <class T, class U>
-struct is_same_signedness
-    : public std::integral_constant<bool, std::is_signed<T>::value == std::is_signed<U>::value> {};
+struct is_same_signedness : public std::integral_constant<bool, std::is_signed<T>::value == std::is_signed<U>::value> {
+};
 
 template <class T, class Enable = void>
 struct safe_undeflying_type {

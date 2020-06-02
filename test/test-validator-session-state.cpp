@@ -23,10 +23,11 @@
     exception statement from your version. If you delete this exception statement 
     from all source files in the program, then also delete it here.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "adnl/adnl.h"
 
+#include "td/utils/misc.h"
 #include "td/utils/port/signals.h"
 #include "td/utils/port/path.h"
 #include "td/utils/Random.h"
@@ -34,6 +35,7 @@
 #include "validator-session/validator-session-description.h"
 #include "validator-session/validator-session-state.h"
 
+#include <limits>
 #include <memory>
 #include <set>
 
@@ -193,7 +195,8 @@ class Description : public ton::validatorsession::ValidatorSessionDescription {
 
   Description(ton::validatorsession::ValidatorSessionOptions opts, td::uint32 total_nodes)
       : opts_(opts), total_nodes_(total_nodes) {
-    pdata_size_[0] = 1ull << 33;
+    pdata_size_[0] =
+        static_cast<std::size_t>(std::numeric_limits<std::size_t>::max() < (1ull << 32) ? 1ull << 30 : 1ull << 33);
     pdata_size_[1] = 1 << 22;
     pdata_[0] = new td::uint8[pdata_size_[0]];
     pdata_[1] = new td::uint8[pdata_size_[1]];
@@ -315,8 +318,8 @@ int main() {
       CHECK(!found);
       auto vec = s->choose_blocks_to_approve(desc, i);
       CHECK(vec.size() == 1);
-      CHECK(vec[1] == nullptr);
-      CHECK(ton::validatorsession::SentBlock::get_block_id(vec[1]) == ton::validatorsession::skip_round_candidate_id());
+      CHECK(vec[0] == nullptr);
+      CHECK(ton::validatorsession::SentBlock::get_block_id(vec[0]) == ton::validatorsession::skip_round_candidate_id());
     }
 
     for (td::uint32 i = 0; i < total_nodes; i++) {

@@ -14,12 +14,13 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "interfaces/shard.h"
 #include "vm/db/StaticBagOfCellsDb.h"
 #include "block/mc-config.h"
+#include "config.hpp"
 
 namespace ton {
 
@@ -137,6 +138,13 @@ class MasterchainStateQ : public MasterchainState, public ShardStateQ {
   bool check_old_mc_block_id(const ton::BlockIdExt& blkid, bool strict = false) const override;
   std::shared_ptr<block::ConfigInfo> get_config() const {
     return config_;
+  }
+  td::Result<td::Ref<ConfigHolder>> get_config_holder() const override {
+    if (!config_) {
+      return td::Status::Error(ErrorCode::notready, "config not found");
+    } else {
+      return td::make_ref<ConfigHolderQ>(config_);
+    }
   }
 
  private:

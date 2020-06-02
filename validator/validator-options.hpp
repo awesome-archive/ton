@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -33,7 +33,10 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
     return init_block_id_;
   }
   bool need_monitor(ShardIdFull shard) const override {
-    return check_shard_(shard);
+    return check_shard_(shard, 0, ShardCheckMode::m_monitor);
+  }
+  bool need_validate(ShardIdFull shard, CatchainSeqno cc_seqno) const override {
+    return check_shard_(shard, cc_seqno, ShardCheckMode::m_validate);
   }
   bool allow_blockchain_init() const override {
     return allow_blockchain_init_;
@@ -46,6 +49,12 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   }
   td::ClocksBase::Duration state_ttl() const override {
     return state_ttl_;
+  }
+  td::ClocksBase::Duration archive_ttl() const override {
+    return archive_ttl_;
+  }
+  td::ClocksBase::Duration key_proof_ttl() const override {
+    return key_proof_ttl_;
   }
   bool initial_sync_disabled() const override {
     return initial_sync_disabled_;
@@ -61,7 +70,7 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
     }
     return false;
   }
-  td::uint32 get_vertical_height(BlockSeqno seqno) const override {
+  td::uint32 get_vertical_seqno(BlockSeqno seqno) const override {
     size_t best = 0;
     for (size_t i = 0; i < hardforks_.size(); i++) {
       if (seqno >= hardforks_[i].seqno()) {
@@ -70,6 +79,35 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
     }
     return static_cast<td::uint32>(best);
   }
+  td::uint32 get_maximal_vertical_seqno() const override {
+    return td::narrow_cast<td::uint32>(hardforks_.size());
+  }
+  td::uint32 get_last_fork_masterchain_seqno() const override {
+    return hardforks_.size() ? hardforks_.rbegin()->seqno() : 0;
+  }
+  std::vector<BlockIdExt> get_hardforks() const override {
+    return hardforks_;
+  }
+  bool check_unsafe_resync_allowed(CatchainSeqno seqno) const override {
+    return unsafe_catchains_.count(seqno) > 0;
+  }
+  td::uint32 check_unsafe_catchain_rotate(BlockSeqno seqno, CatchainSeqno cc_seqno) const override {
+    auto it = unsafe_catchain_rotates_.find(cc_seqno);
+    if (it == unsafe_catchain_rotates_.end()) {
+      return 0;
+    } else {
+      return it->second.first <= seqno ? it->second.second : 0;
+    }
+  }
+  bool need_db_truncate() const override {
+    return truncate_ > 0;
+  }
+  BlockSeqno get_truncate_seqno() const override {
+    return truncate_;
+  }
+  BlockSeqno sync_upto() const override {
+    return sync_upto_;
+  }
 
   void set_zero_block_id(BlockIdExt block_id) override {
     zero_block_id_ = block_id;
@@ -77,7 +115,7 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   void set_init_block_id(BlockIdExt block_id) override {
     init_block_id_ = block_id;
   }
-  void set_shard_check_function(std::function<bool(ShardIdFull)> check_shard) override {
+  void set_shard_check_function(std::function<bool(ShardIdFull, CatchainSeqno, ShardCheckMode)> check_shard) override {
     check_shard_ = std::move(check_shard);
   }
   void set_allow_blockchain_init(bool value) override {
@@ -92,11 +130,29 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   void set_state_ttl(td::ClocksBase::Duration value) override {
     state_ttl_ = value;
   }
+  void set_archive_ttl(td::ClocksBase::Duration value) override {
+    archive_ttl_ = value;
+  }
+  void set_key_proof_ttl(td::ClocksBase::Duration value) override {
+    key_proof_ttl_ = value;
+  }
   void set_initial_sync_disabled(bool value) override {
     initial_sync_disabled_ = value;
   }
   void set_hardforks(std::vector<BlockIdExt> vec) override {
     hardforks_ = std::move(vec);
+  }
+  void add_unsafe_resync_catchain(CatchainSeqno seqno) override {
+    unsafe_catchains_.insert(seqno);
+  }
+  void add_unsafe_catchain_rotate(BlockSeqno seqno, CatchainSeqno cc_seqno, td::uint32 value) override {
+    unsafe_catchain_rotates_[cc_seqno] = std::make_pair(seqno, value);
+  }
+  void truncate_db(BlockSeqno seqno) override {
+    truncate_ = seqno;
+  }
+  void set_sync_upto(BlockSeqno seqno) override {
+    sync_upto_ = seqno;
   }
 
   ValidatorManagerOptionsImpl *make_copy() const override {
@@ -104,9 +160,11 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   }
 
   ValidatorManagerOptionsImpl(BlockIdExt zero_block_id, BlockIdExt init_block_id,
-                              std::function<bool(ShardIdFull)> check_shard, bool allow_blockchain_init,
-                              td::ClocksBase::Duration sync_blocks_before, td::ClocksBase::Duration block_ttl,
-                              td::ClocksBase::Duration state_ttl, bool initial_sync_disabled)
+                              std::function<bool(ShardIdFull, CatchainSeqno, ShardCheckMode)> check_shard,
+                              bool allow_blockchain_init, td::ClocksBase::Duration sync_blocks_before,
+                              td::ClocksBase::Duration block_ttl, td::ClocksBase::Duration state_ttl,
+                              td::ClocksBase::Duration archive_ttl, td::ClocksBase::Duration key_proof_ttl,
+                              bool initial_sync_disabled)
       : zero_block_id_(zero_block_id)
       , init_block_id_(init_block_id)
       , check_shard_(std::move(check_shard))
@@ -114,19 +172,27 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
       , sync_blocks_before_(sync_blocks_before)
       , block_ttl_(block_ttl)
       , state_ttl_(state_ttl)
+      , archive_ttl_(archive_ttl)
+      , key_proof_ttl_(key_proof_ttl)
       , initial_sync_disabled_(initial_sync_disabled) {
   }
 
  private:
   BlockIdExt zero_block_id_;
   BlockIdExt init_block_id_;
-  std::function<bool(ShardIdFull)> check_shard_;
+  std::function<bool(ShardIdFull, CatchainSeqno, ShardCheckMode)> check_shard_;
   bool allow_blockchain_init_;
   td::ClocksBase::Duration sync_blocks_before_;
   td::ClocksBase::Duration block_ttl_;
   td::ClocksBase::Duration state_ttl_;
+  td::ClocksBase::Duration archive_ttl_;
+  td::ClocksBase::Duration key_proof_ttl_;
   bool initial_sync_disabled_;
   std::vector<BlockIdExt> hardforks_;
+  std::set<CatchainSeqno> unsafe_catchains_;
+  std::map<CatchainSeqno, std::pair<BlockSeqno, td::uint32>> unsafe_catchain_rotates_;
+  BlockSeqno truncate_{0};
+  BlockSeqno sync_upto_{0};
 };
 
 }  // namespace validator

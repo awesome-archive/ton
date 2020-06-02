@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -53,6 +53,9 @@ class PathView {
 
   Slice parent_dir() const {
     return path_.substr(0, last_slash_ + 1);
+  }
+  Slice parent_dir_noslash() const {
+    return last_slash_ <= 0 ? td::Slice(".") : path_.substr(0, last_slash_);
   }
 
   Slice extension() const {

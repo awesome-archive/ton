@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #include "td/utils/port/StdStreams.h"
 
@@ -27,6 +27,7 @@
 #include "td/utils/Slice.h"
 
 #include <atomic>
+#include <cassert>
 
 namespace td {
 
@@ -35,6 +36,7 @@ template <int id>
 static FileFd &get_file_fd() {
   static FileFd result = FileFd::from_native_fd(NativeFd(id, true));
   static auto guard = td::ScopeExit() + [&] { result.move_as_native_fd().release(); };
+  assert(!result.empty());
   return result;
 }
 

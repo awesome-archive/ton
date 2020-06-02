@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -25,6 +25,7 @@
 
 #include <tuple>
 #include <utility>
+#include <set>
 
 namespace td {
 namespace format {
@@ -331,6 +332,10 @@ StringBuilder &operator<<(StringBuilder &sb, const std::pair<A, B> &p) {
 
 template <class T>
 StringBuilder &operator<<(StringBuilder &stream, const vector<T> &vec) {
+  return stream << format::as_array(vec);
+}
+template <class T>
+StringBuilder &operator<<(StringBuilder &stream, const std::set<T> &vec) {
   return stream << format::as_array(vec);
 }
 
