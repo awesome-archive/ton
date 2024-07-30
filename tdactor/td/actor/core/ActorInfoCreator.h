@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "td/actor/core/ActorInfo.h"
@@ -82,6 +82,9 @@ class ActorInfoCreator {
   }
   ~ActorInfoCreator() {
     clear();
+  }
+  void ensure_empty() {
+    pool_.for_each([](auto &actor_info) { LOG(ERROR) << actor_info.get_name(); });
   }
 
  private:

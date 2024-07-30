@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -24,8 +24,10 @@
 
 #include "td/db/KeyValue.h"
 #include "td/utils/Status.h"
+#include "td/utils/optional.h"
 
 namespace rocksdb {
+class Cache;
 class OptimisticTransactionDB;
 class Transaction;
 class WriteBatch;
@@ -34,16 +36,28 @@ class Statistics;
 }  // namespace rocksdb
 
 namespace td {
+
+struct RocksDbOptions {
+  std::shared_ptr<rocksdb::Statistics> statistics = nullptr;
+  std::shared_ptr<rocksdb::Cache> block_cache;  // Default - one 1G cache for all RocksDb
+  bool use_direct_reads = false;
+};
+
 class RocksDb : public KeyValue {
  public:
   static Status destroy(Slice path);
   RocksDb clone() const;
-  static Result<RocksDb> open(std::string path);
+  static Result<RocksDb> open(std::string path, RocksDbOptions options = {});
 
   Result<GetStatus> get(Slice key, std::string &value) override;
   Status set(Slice key, Slice value) override;
   Status erase(Slice key) override;
   Result<size_t> count(Slice prefix) override;
+  Status for_each(std::function<Status(Slice, Slice)> f) override;
+
+  Status begin_write_batch() override;
+  Status commit_write_batch() override;
+  Status abort_write_batch() override;
 
   Status begin_transaction() override;
   Status commit_transaction() override;
@@ -56,13 +70,23 @@ class RocksDb : public KeyValue {
   std::unique_ptr<KeyValueReader> snapshot() override;
   std::string stats() const override;
 
+  static std::shared_ptr<rocksdb::Statistics> create_statistics();
+  static std::string statistics_to_string(const std::shared_ptr<rocksdb::Statistics> statistics);
+  static void reset_statistics(const std::shared_ptr<rocksdb::Statistics> statistics);
+
+  static std::shared_ptr<rocksdb::Cache> create_cache(size_t capacity);
+
   RocksDb(RocksDb &&);
   RocksDb &operator=(RocksDb &&);
   ~RocksDb();
 
+  std::shared_ptr<rocksdb::OptimisticTransactionDB> raw_db() const {
+    return db_;
+  };
+
  private:
   std::shared_ptr<rocksdb::OptimisticTransactionDB> db_;
-  std::shared_ptr<rocksdb::Statistics> statistics_;
+  RocksDbOptions options_;
 
   std::unique_ptr<rocksdb::Transaction> transaction_;
   std::unique_ptr<rocksdb::WriteBatch> write_batch_;
@@ -75,7 +99,6 @@ class RocksDb : public KeyValue {
   };
   std::unique_ptr<const rocksdb::Snapshot, UnreachableDeleter> snapshot_;
 
-  explicit RocksDb(std::shared_ptr<rocksdb::OptimisticTransactionDB> db,
-                   std::shared_ptr<rocksdb::Statistics> statistics);
+  explicit RocksDb(std::shared_ptr<rocksdb::OptimisticTransactionDB> db, RocksDbOptions options);
 };
 }  // namespace td

@@ -14,7 +14,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 
@@ -37,13 +37,14 @@ class AsyncStateSerializer : public td::actor::Actor {
   bool saved_to_db_ = true;
 
   td::Ref<ValidatorManagerOptions> opts_;
+  td::CancellationTokenSource cancellation_token_source_;
 
   td::actor::ActorId<ValidatorManager> manager_;
 
   td::uint32 next_idx_ = 0;
 
   BlockHandle masterchain_handle_;
-  td::Ref<MasterchainState> masterchain_state_;
+  bool have_masterchain_state_ = false;
 
   std::vector<BlockIdExt> shards_;
 
@@ -65,13 +66,16 @@ class AsyncStateSerializer : public td::actor::Actor {
   void got_self_state(AsyncSerializerState state);
   void got_init_handle(BlockHandle handle);
 
+  void request_masterchain_state();
+  void request_shard_state(BlockIdExt shard);
+
   void next_iteration();
   void got_top_masterchain_handle(BlockIdExt block_id);
   void got_masterchain_handle(BlockHandle handle_);
-  void got_masterchain_state(td::Ref<MasterchainState> state);
+  void got_masterchain_state(td::Ref<MasterchainState> state, std::shared_ptr<vm::CellDbReader> cell_db_reader);
   void stored_masterchain_state();
   void got_shard_handle(BlockHandle handle);
-  void got_shard_state(BlockHandle handle, td::Ref<ShardState> state);
+  void got_shard_state(BlockHandle handle, td::Ref<ShardState> state, std::shared_ptr<vm::CellDbReader> cell_db_reader);
 
   void get_masterchain_seqno(td::Promise<BlockSeqno> promise) {
     promise.set_result(last_block_id_.id.seqno);
@@ -86,6 +90,8 @@ class AsyncStateSerializer : public td::actor::Actor {
   void fail_handler(td::Status reason);
   void fail_handler_cont();
   void success_handler();
+
+  void update_options(td::Ref<ValidatorManagerOptions> opts);
 };
 
 }  // namespace validator

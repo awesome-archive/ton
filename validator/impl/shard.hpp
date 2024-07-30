@@ -14,12 +14,13 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 
-    Copyright 2017-2019 Telegram Systems LLP
+    Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
 #include "interfaces/shard.h"
 #include "vm/db/StaticBagOfCellsDb.h"
 #include "block/mc-config.h"
+#include "config.hpp"
 
 namespace ton {
 
@@ -40,6 +41,7 @@ class ShardStateQ : virtual public ShardState {
   bool before_split_{false};
   bool fake_split_{false};
   bool fake_merge_{false};
+  td::optional<BlockIdExt> master_ref;
 
  protected:
   friend class Ref<ShardStateQ>;
@@ -79,6 +81,9 @@ class ShardStateQ : virtual public ShardState {
   LogicalTime get_logical_time() const override {
     return lt;
   }
+  td::optional<BlockIdExt> get_master_ref() const override {
+    return master_ref;
+  }
   td::Status validate_deep() const override;
   ShardStateQ* make_copy() const override;
   td::Result<Ref<MessageQueue>> message_queue() const override;
@@ -86,6 +91,7 @@ class ShardStateQ : virtual public ShardState {
   td::Result<Ref<ShardState>> merge_with(const ShardState& with) const override;
   td::Result<std::pair<Ref<ShardState>, Ref<ShardState>>> split() const override;
   td::Result<td::BufferSlice> serialize() const override;
+  td::Status serialize_to_file(td::FileFd& fd) const override;
 };
 
 #if TD_MSVC
@@ -124,6 +130,10 @@ class MasterchainStateQ : public MasterchainState, public ShardStateQ {
   ValidatorSessionConfig get_consensus_config() const override {
     return config_->get_consensus_config();
   }
+  block::SizeLimitsConfig::ExtMsgLimits get_ext_msg_limits() const override {
+    auto R = config_->get_size_limits_config();
+    return R.is_error() ? block::SizeLimitsConfig::ExtMsgLimits() : R.ok_ref().ext_msg_limits;
+  }
   BlockIdExt last_key_block_id() const override;
   BlockIdExt next_key_block_id(BlockSeqno seqno) const override;
   BlockIdExt prev_key_block_id(BlockSeqno seqno) const override;
@@ -137,6 +147,13 @@ class MasterchainStateQ : public MasterchainState, public ShardStateQ {
   bool check_old_mc_block_id(const ton::BlockIdExt& blkid, bool strict = false) const override;
   std::shared_ptr<block::ConfigInfo> get_config() const {
     return config_;
+  }
+  td::Result<td::Ref<ConfigHolder>> get_config_holder() const override {
+    if (!config_) {
+      return td::Status::Error(ErrorCode::notready, "config not found");
+    } else {
+      return td::make_ref<ConfigHolderQ>(config_);
+    }
   }
 
  private:
